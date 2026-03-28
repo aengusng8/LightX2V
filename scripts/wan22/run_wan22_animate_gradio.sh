@@ -12,7 +12,7 @@ source "${lightx2v_path}/scripts/base/base.sh"
 
 # Optional: port and share (e.g. --port 8030 --share)
 port=7863
-share=""
+share="1"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --port) port="$2"; shift 2 ;;

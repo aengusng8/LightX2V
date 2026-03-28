@@ -62,12 +62,17 @@ class QuantWeightFP8(QuantTemplate):
             max_val = w.abs().amax(dim=1, keepdim=True).clamp(min=1e-5)
         else:
             max_val = w.abs().max()
+        # FP8 limits
         finfo = torch.finfo(torch.float8_e4m3fn)
         qmin, qmax = finfo.min, finfo.max
+        # scale
         scales = max_val / qmax
+        # normalize
         scaled_tensor = w / scales
-        scaled_tensor = torch.clip(scaled_tensor, qmin, qmax)
-        w_q = float_quantize(scaled_tensor.float(), 4, 3, rounding="nearest").to(torch.float8_e4m3fn)
+        # clamp to FP8 range
+        scaled_tensor = torch.clamp(scaled_tensor, qmin, qmax)
+        # ✅ direct cast (NO qtorch)
+        w_q = scaled_tensor.to(torch.float8_e4m3fn)
 
         assert torch.isnan(scales).sum() == 0
         assert torch.isnan(w_q).sum() == 0
