@@ -4,10 +4,10 @@
 lightx2v_path=/workspace/LightX2V
 model_path=/workspace/LightX2V/Wan2.2-Animate-14B
 video_path=/workspace/LightX2V/examples_video/wan_animate/animate/dancing_4.mp4
-refer_path=/workspace/LightX2V/examples_video/wan_animate/animate/sydney.jpeg
+refer_path=/workspace/LightX2V/examples_video/wan_animate/animate/lan.jpg
 use_flux=false
 
-process_dir=${lightx2v_path}/save_results/replace/process_results_${use_flux}
+process_dir=${lightx2v_path}/save_results/replace_quang/process_results_${use_flux}
 export CUDA_VISIBLE_DEVICES=0
 
 # set environment variables
@@ -25,6 +25,13 @@ preprocess_args=(
     --w_len 1
     --h_len 1
     --replace_flag
+    --compose_refer_on_first_frame
+    --lbm_relight
+    --lbm_relight_ckpt ${model_path}/lbm_relighting
+    --lbm_relight_steps 4
+    --lbm_fuse_mode wavelet
+    --lbm_wavelet haar
+    --lbm_wavelet_level 1
 )
 # keep this option consistent with run_wan22_animate.sh
 # preprocess_data requires --retarget_flag when --use_flux is set
@@ -36,7 +43,9 @@ python ${lightx2v_path}/tools/preprocess/preprocess_data.py "${preprocess_args[@
 # if [[ "$use_flux" == true ]]; then
 #     src_ref_images=${process_dir}/refer_edit.png
 # else
-src_ref_images=${process_dir}/src_ref.png
+src_ref_images=${process_dir}/reference_wavelet_merged.png
+# src_ref_images=${process_dir}/src_ref.png
+
 # fi
 
 python -m lightx2v.infer \

@@ -3,6 +3,7 @@ import os
 import shutil
 
 import cv2
+import imageio
 import numpy as np
 import torch
 from PIL import Image
@@ -20,26 +21,72 @@ from human_visualization import draw_aapose_by_meta_new
 from pose2d import Pose2d
 from pose2d_utils import AAPoseMeta
 from retarget_pose import get_retarget_pose
-from utils import get_aug_mask, get_face_bboxes, get_frame_indices, get_mask_body_img, padding_resize, resize_by_area
+from utils import (
+    compose_refer_on_first_frame as compose_refer_by_pose,
+    fuse_relight_wavelet_dwt2,
+    get_aug_mask,
+    get_face_bboxes,
+    get_frame_indices,
+    get_mask_body_img,
+    padding_resize,
+    paste_relit_onto_refer_canvas,
+    resize_by_area,
+)
 
 transformer.USE_FLASH_ATTN = False
 transformer.MATH_KERNEL_ON = True
 transformer.OLD_GPU = True
-from sam_utils import build_sam2_video_predictor  # noqa
+from sam_utils import build_sam2_image_predictor, build_sam2_video_predictor  # noqa
 
 
 class ProcessPipeline:
-    def __init__(self, det_checkpoint_path, pose2d_checkpoint_path, sam_checkpoint_path, flux_kontext_path):
+    def __init__(
+        self,
+        det_checkpoint_path,
+        pose2d_checkpoint_path,
+        sam_checkpoint_path,
+        flux_kontext_path,
+        lbm_relight_ckpt_dir=None,
+        lbm_relight_steps=1,
+        lbm_relight=False,
+        lbm_fuse_mode="wavelet",
+        lbm_wavelet="haar",
+        lbm_wavelet_level=2,
+    ):
         self.pose2d = Pose2d(checkpoint=pose2d_checkpoint_path, detector_checkpoint=det_checkpoint_path)
 
         model_cfg = "sam2_hiera_l.yaml"
         if sam_checkpoint_path is not None:
             self.predictor = build_sam2_video_predictor(model_cfg, sam_checkpoint_path)
+            self.image_predictor = build_sam2_image_predictor(model_cfg, sam_checkpoint_path)
         if flux_kontext_path is not None:
             # Load FLUX.2 Klein (9B) pipeline for image editing during pose retargeting.
             self.flux_kontext = Flux2KleinPipeline.from_pretrained(flux_kontext_path, torch_dtype=torch.bfloat16).to("cuda")
 
-    def __call__(self, video_path, refer_image_path, output_path, resolution_area=[1280, 720], fps=30, iterations=3, k=7, w_len=1, h_len=1, retarget_flag=False, use_flux=False, replace_flag=False):
+        self.lbm_relight = bool(lbm_relight)
+        self.lbm_relight_ckpt_dir = lbm_relight_ckpt_dir
+        self.lbm_relight_steps = int(lbm_relight_steps)
+        self.lbm_fuse_mode = (lbm_fuse_mode or "wavelet").lower()
+        self.lbm_wavelet = str(lbm_wavelet)
+        self.lbm_wavelet_level = int(lbm_wavelet_level)
+        self._lbm_relight_model = None
+
+    def __call__(
+        self,
+        video_path,
+        refer_image_path,
+        output_path,
+        resolution_area=[1280, 720],
+        fps=30,
+        iterations=3,
+        k=7,
+        w_len=1,
+        h_len=1,
+        retarget_flag=False,
+        use_flux=False,
+        replace_flag=False,
+        compose_refer_on_first_frame=False,
+    ):
         if replace_flag:
             video_reader = VideoReader(video_path)
             frame_num = len(video_reader)
@@ -87,6 +134,57 @@ class ProcessPipeline:
             refer_img = refer_img[..., ::-1]
 
             refer_img = padding_resize(refer_img, height, width)
+            if compose_refer_on_first_frame:
+                refer_pose_for_compose = self.pose2d([refer_img])[0]
+                refer_fg = None
+                refer_fg = self.get_refer_person_mask_sam2(refer_img, refer_pose_for_compose)
+                if refer_fg is not None:
+                    try:
+                        imageio.imwrite(
+                            os.path.join(output_path, "refer_sam_mask.png"),
+                            (np.clip(refer_fg, 0.0, 1.0) * 255.0).astype(np.uint8),
+                        )
+                    except Exception:
+                        pass
+
+                # Extract SAM2 mask for the first frame (canvas) so the paste mask covers it.
+                canvas_cover_mask = None
+                try:
+                    canvas_mask = self.get_refer_person_mask_sam2(frames[0], tpl_pose_metas[0])
+                    if canvas_mask is not None:
+                        cm = canvas_mask.astype(np.float32)
+                        if cm.max() > 1.5:
+                            cm = cm / 255.0
+                        cm = np.clip(cm, 0.0, 1.0)
+                        canvas_cover_mask = cm
+                        imageio.imwrite(
+                            os.path.join(output_path, "canvas_sam_mask.png"),
+                            (canvas_cover_mask * 255.0).astype(np.uint8),
+                        )
+                except Exception as e:
+                    logger.warning(f"SAM2 canvas-mask extraction failed; continuing without canvas cover. Error: {e}")
+
+                composed, warped_a, aff_m, alpha_ref = compose_refer_by_pose(
+                    refer_img,
+                    frames[0],
+                    refer_pose_for_compose,
+                    tpl_pose_metas[0],
+                    refer_fg_mask=refer_fg,
+                    canvas_cover_mask=canvas_cover_mask,
+                    use_masks_for_placement=True,
+                )
+                # Save compose outputs for debugging/inspection.
+                try:
+                    imageio.imwrite(os.path.join(output_path, "composited_on_canvas_raw.png"), composed)
+                    imageio.imwrite(os.path.join(output_path, "warped_a.png"), (np.clip(warped_a, 0.0, 1.0) * 255.0).astype(np.uint8))
+                except Exception:
+                    pass
+                self._save_composed_with_optional_lbm(
+                    composed,
+                    output_path,
+                    refer_rgb=refer_img,
+                    compose_extra={"warped_a": warped_a, "M": aff_m, "alpha_ref": alpha_ref},
+                )
             logger.info(f"Processing template video: {video_path}")
             tpl_retarget_pose_metas = [AAPoseMeta.from_humanapi_meta(meta) for meta in tpl_pose_metas]
             cond_images = []
@@ -144,7 +242,6 @@ class ProcessPipeline:
             refer_pose_visual = draw_aapose_by_meta_new(refer_pose_canvas, AAPoseMeta.from_humanapi_meta(refer_pose_meta_np))
             refer_pose_path = os.path.join(output_path, "refer_pose.png")
             refer_img_path = os.path.join(output_path, "refer_img.png")
-            import imageio
 
             imageio.imwrite(refer_pose_path, refer_pose_visual)
             imageio.imwrite(refer_img_path, refer_img)
@@ -178,6 +275,16 @@ class ProcessPipeline:
 
             tpl_pose_meta0 = self.pose2d(frames[:1])[0]
             tpl_pose_metas = self.pose2d(frames)
+
+            if compose_refer_on_first_frame:
+                composed, warped_a, aff_m, alpha_ref = compose_refer_by_pose(refer_img, frames[0], refer_pose_meta, tpl_pose_meta0)
+                self._save_composed_with_optional_lbm(
+                    composed,
+                    output_path,
+                    first_frame_rgb=frames[0],
+                    refer_rgb=refer_img,
+                    compose_extra={"warped_a": warped_a, "M": aff_m, "alpha_ref": alpha_ref},
+                )
 
             face_images = []
             for idx, meta in enumerate(tpl_pose_metas):
@@ -251,6 +358,84 @@ class ProcessPipeline:
             mpy.ImageSequenceClip(cond_images, fps=fps).write_videofile(src_pose_path)
             return True
 
+    def _ensure_lbm_relight_model(self):
+        if self._lbm_relight_model is not None:
+            return self._lbm_relight_model
+        if not self.lbm_relight_ckpt_dir:
+            return None
+        from lbm_relight_utils import load_lbm_relighting_model
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._lbm_relight_model = load_lbm_relighting_model(self.lbm_relight_ckpt_dir, device=device)
+        return self._lbm_relight_model
+
+    def _save_composed_with_optional_lbm(
+        self,
+        composed_rgb,
+        output_path,
+        refer_rgb=None,
+        compose_extra=None,
+    ):
+        """Save composed image, relit composed image, and optional reference wavelet merge."""
+        p = output_path
+        composed_out = os.path.join(p, "composited_on_canvas.png")
+        relit_composed_out = os.path.join(p, "relit_composited_on_canvas.png")
+        wave_out = os.path.join(p, "reference_wavelet_merged.png")
+
+        # Always save the composed image.
+        imageio.imwrite(composed_out, composed_rgb)
+
+        if not self.lbm_relight or not self.lbm_relight_ckpt_dir:
+            return
+
+        try:
+            from lbm_relight_utils import lbm_available, relight_numpy_rgb
+
+            if not lbm_available():
+                logger.warning("LBM package not installed; skipping reference_wavelet_merged.png")
+                return
+            if not torch.cuda.is_available():
+                logger.warning("LBM expects CUDA; skipping reference_wavelet_merged.png")
+                return
+
+            model = self._ensure_lbm_relight_model()
+            relit = relight_numpy_rgb(model, composed_rgb, num_sampling_steps=self.lbm_relight_steps)
+            imageio.imwrite(relit_composed_out, relit)
+
+            if self.lbm_fuse_mode != "wavelet":
+                logger.info("Saved composed + relit composed; skipping reference_wavelet_merged.png (set --lbm_fuse_mode wavelet).")
+                return
+            if compose_extra is None or refer_rgb is None:
+                logger.warning("Cannot build reference_wavelet_merged.png without compose_extra and refer_rgb.")
+                return
+
+            relit_on_ref = paste_relit_onto_refer_canvas(
+                relit,
+                refer_rgb,
+                compose_extra["M"],
+                compose_extra["alpha_ref"],
+                frame_alpha=compose_extra.get("warped_a"),
+            )
+            imageio.imwrite(os.path.join(p, "relit_on_ref.png"), relit_on_ref)
+            try:
+                refer_final = fuse_relight_wavelet_dwt2(
+                    relit_on_ref,
+                    refer_rgb,
+                    wavelet=self.lbm_wavelet,
+                    level=self.lbm_wavelet_level,
+                )
+            except ImportError:
+                logger.warning("PyWavelets not installed; reference_wavelet_merged.png not written")
+                return
+            except Exception as e:
+                logger.warning(f"Wavelet merge failed; reference_wavelet_merged.png not written: {e}")
+                return
+
+            imageio.imwrite(wave_out, refer_final)
+            logger.info(f"Saved {wave_out}")
+        except Exception as e:
+            logger.warning(f"LBM / reference_wavelet_merged.png failed: {e}")
+
     def get_editing_prompts(self, tpl_pose_metas, refer_pose_meta):
         arm_visible = False
         leg_visible = False
@@ -302,6 +487,30 @@ class ProcessPipeline:
         tpl_prompt += " KEEP THE PERSON'S IDENTITY. KEEP THE ORIGINAL FACIAL EXPRESSION, AND FACE ANGLE CONSISTENT. MAINTAIN THE EXISTING BACKGROUND. PRESERVE THE LIGHTING AND OVERALL COMPOSITION OF THE IMAGE."
         refer_prompt += " KEEP THE PERSON'S IDENTITY. KEEP THE ORIGINAL FACIAL EXPRESSION, AND FACE ANGLE CONSISTENT. MAINTAIN THE EXISTING BACKGROUND. PRESERVE THE LIGHTING AND OVERALL COMPOSITION OF THE IMAGE."
         return tpl_prompt, refer_prompt
+
+    def get_refer_person_mask_sam2(self, refer_rgb, pose_meta):
+        """Segment the person on the reference image (same SAM2 path as video).
+
+        Returns:
+            float32 (H,W) in [0,1] or None.
+        """
+        pred = getattr(self, "predictor", None)
+        if pred is None:
+            return None
+        meta = self.convert_list_to_array([dict(pose_meta)])[0]
+        m = self.get_mask_one_frame(refer_rgb, meta)
+        if m is None:
+            return None
+        m = m.astype(np.float32)
+        if m.max() > 1.5:
+            m = m / 255.0
+        m = np.clip(m, 0.0, 1.0)
+        h, w = refer_rgb.shape[:2]
+        if m.shape[0] != h or m.shape[1] != w:
+            m = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
+        if float(m.sum()) < 64.0:
+            return None
+        return m
 
     def get_mask(self, frames, th_step, kp2ds_all):
         frame_num = len(frames)
@@ -364,6 +573,92 @@ class ProcessPipeline:
                     all_mask.append(out_mask)
 
         return all_mask
+
+    def get_mask_one_frame(self, frame, kp2d):
+        """
+        SAM2 foreground mask for a single frame using pose body keypoints as positive prompts.
+
+        Args:
+            frame: np.ndarray [H, W, 3]
+            kp2d: dict containing keys:
+                - "keypoints_body" (normalized keypoints [N, 3] or equivalent)
+                - "width", "height"
+
+        Returns:
+            np.ndarray [H, W] uint8 mask, or None if unavailable.
+        """
+        pred = getattr(self, "predictor", None)
+        if pred is None:
+            return None
+        if frame is None or kp2d is None:
+            return None
+
+        key_points_index = [0, 1, 2, 5, 8, 11, 10, 13]
+        keypoints_body_list = []
+        body_key_points = kp2d.get("keypoints_body", None)
+        if body_key_points is None:
+            return None
+
+        for each_index in key_points_index:
+            if each_index >= len(body_key_points):
+                continue
+            each_keypoint = body_key_points[each_index]
+            if each_keypoint is None:
+                continue
+            keypoints_body_list.append(each_keypoint)
+
+        if len(keypoints_body_list) == 0:
+            return None
+
+        keypoints_body = np.array(keypoints_body_list)[:, :2]
+        wh = np.array([[kp2d["width"], kp2d["height"]]])
+        keypoints_px = keypoints_body * wh
+        center_point = keypoints_px.mean(axis=0, keepdims=True)
+        points = center_point.astype(np.int32)
+
+        labels = np.array([1], np.int32)
+        out_mask = None
+        image_predictor = getattr(self, "image_predictor", None)
+        if image_predictor is not None:
+            image_predictor.set_image(frame)
+            masks, scores, _ = image_predictor.predict(
+                point_coords=points.astype(np.float32),
+                point_labels=labels,
+                multimask_output=True,
+            )
+            if masks is not None and len(masks) > 0:
+                masks_bin = (masks > 0).astype(np.uint8)
+                areas = masks_bin.reshape(masks_bin.shape[0], -1).sum(axis=1).astype(np.float32)
+                if scores is None:
+                    scores = np.zeros((masks_bin.shape[0],), dtype=np.float32)
+                else:
+                    scores = np.asarray(scores, dtype=np.float32)
+                    if scores.shape[0] != masks_bin.shape[0]:
+                        scores = np.zeros((masks_bin.shape[0],), dtype=np.float32)
+                # Choose whole-person candidate: largest area first, score as tie-break.
+                best_idx = int(np.argmax(areas * 1e3 + scores))
+                out_mask = masks_bin[best_idx]
+        else:
+            # Fallback to video predictor on a single-frame sequence.
+            inference_state = self.predictor.init_state_v2(frames=[frame])
+            self.predictor.reset_state(inference_state)
+            self.predictor.add_new_points(
+                inference_state=inference_state,
+                frame_idx=0,
+                obj_id=1,
+                points=points,
+                labels=labels,
+            )
+            for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(inference_state):
+                if out_frame_idx != 0:
+                    continue
+                for i, _ in enumerate(out_obj_ids):
+                    out_mask = (out_mask_logits[i] > 0.0).cpu().numpy()[0].astype(np.uint8)
+                    break
+                if out_mask is not None:
+                    break
+
+        return out_mask
 
     def convert_list_to_array(self, metas):
         metas_list = []

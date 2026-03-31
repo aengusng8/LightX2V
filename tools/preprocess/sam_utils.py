@@ -9,7 +9,8 @@ from PIL import Image
 from hydra import compose
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
-from sam2.build_sam import _load_checkpoint
+from sam2.build_sam import _load_checkpoint, build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.utils.misc import *
 from sam2.utils.misc import AsyncVideoFrameLoader, _load_img_as_tensor
 from tqdm import tqdm
@@ -144,3 +145,17 @@ def build_sam2_video_predictor(
     if mode == "eval":
         model.eval()
     return model
+
+
+def build_sam2_image_predictor(
+    config_file,
+    ckpt_path=None,
+    device="cuda",
+    mode="eval",
+):
+    """
+    Build SAM2 image predictor for single-frame image prompting.
+    """
+    model = build_sam2(config_file, ckpt_path=ckpt_path, device=device, mode=mode)
+    predictor = SAM2ImagePredictor(model)
+    return predictor

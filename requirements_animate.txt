@@ -1,3 +1,4 @@
+PyWavelets
 decord
 peft
 onnxruntime

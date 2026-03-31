@@ -31,6 +31,34 @@ def get_preprocess_parser():
         default=False,
         help="Whether to use image editing in pose retargeting. Recommended if the character in the reference image or the first frame of the driving video is not in a standard, front-facing pose",
     )
+    parser.add_argument(
+        "--compose_refer_on_first_frame",
+        action="store_true",
+        default=False,
+        help="Compose reference on first frame (in memory for LBM path). With --lbm_relight and wavelet mode, only reference_wavelet_merged.png is written from that step.",
+    )
+    parser.add_argument(
+        "--lbm_relight",
+        action="store_true",
+        default=False,
+        help="After compose: LBM + wavelet merge; writes only reference_wavelet_merged.png (needs --lbm_fuse_mode wavelet, PyWavelets). Requires compose, CUDA, LBM.",
+    )
+    parser.add_argument(
+        "--lbm_relight_ckpt",
+        type=str,
+        default=None,
+        help="LBM relighting checkpoint directory or cache dir for HF download. Default: {ckpt_path}/lbm_relighting",
+    )
+    parser.add_argument("--lbm_relight_steps", type=int, default=1, help="LBM sampling steps (default 1 matches upstream).")
+    parser.add_argument(
+        "--lbm_fuse_mode",
+        type=str,
+        default="wavelet",
+        choices=["wavelet", "alpha"],
+        help="wavelet: write reference_wavelet_merged.png. alpha: LBM path writes no image from this step (use wavelet for replace ref output).",
+    )
+    parser.add_argument("--lbm_wavelet", type=str, default="haar", help="Wavelet name for --lbm_fuse_mode wavelet (PyWavelets); default Haar.")
+    parser.add_argument("--lbm_wavelet_level", type=int, default=2, help="Decomposition depth for wavelet fusion.")
 
     # Parameters for the mask strategy in replacement mode. These control the mask's size and shape. Refer to https://arxiv.org/pdf/2502.06145
     parser.add_argument("--iterations", type=int, default=3, help="Number of iterations for mask dilation.")
@@ -56,6 +84,17 @@ def process_input_video(args):
 
     assert len(args.resolution_area) == 2, "resolution_area should be a list of two integers [width, height]"
     assert not args.use_flux or args.retarget_flag, "Image editing with FLUX can only be used when pose retargeting is enabled."
+    if args.lbm_relight and not args.compose_refer_on_first_frame:
+        print("Warning: --lbm_relight has no effect without --compose_refer_on_first_frame")
+
+    lbm_ckpt_dir = None
+    if args.lbm_relight:
+        if args.lbm_relight_ckpt:
+            lbm_ckpt_dir = args.lbm_relight_ckpt
+        elif args.ckpt_path:
+            lbm_ckpt_dir = os.path.join(args.ckpt_path, "lbm_relighting")
+        else:
+            lbm_ckpt_dir = os.path.abspath("lbm_relighting")
 
     pose2d_checkpoint_path = os.path.join(args.ckpt_path, "pose2d/vitpose_h_wholebody.onnx")
     det_checkpoint_path = os.path.join(args.ckpt_path, "det/yolov10m.onnx")
@@ -66,7 +105,16 @@ def process_input_video(args):
     # The FLUX pipeline expects the model files inside `models/flux_klein`.
     flux_kontext_path = os.path.join(args.ckpt_path, "flux_klein") if args.use_flux else None
     process_pipeline = ProcessPipeline(
-        det_checkpoint_path=det_checkpoint_path, pose2d_checkpoint_path=pose2d_checkpoint_path, sam_checkpoint_path=sam2_checkpoint_path, flux_kontext_path=flux_kontext_path
+        det_checkpoint_path=det_checkpoint_path,
+        pose2d_checkpoint_path=pose2d_checkpoint_path,
+        sam_checkpoint_path=sam2_checkpoint_path,
+        flux_kontext_path=flux_kontext_path,
+        lbm_relight_ckpt_dir=lbm_ckpt_dir,
+        lbm_relight_steps=args.lbm_relight_steps,
+        lbm_relight=args.lbm_relight,
+        lbm_fuse_mode=args.lbm_fuse_mode,
+        lbm_wavelet=args.lbm_wavelet,
+        lbm_wavelet_level=args.lbm_wavelet_level,
     )
     os.makedirs(args.save_path, exist_ok=True)
     process_pipeline(
@@ -82,6 +130,7 @@ def process_input_video(args):
         retarget_flag=args.retarget_flag,
         use_flux=args.use_flux,
         replace_flag=args.replace_flag,
+        compose_refer_on_first_frame=args.compose_refer_on_first_frame,
     )
 
 

@@ -84,3 +84,6 @@ RUN cd sam2 && SAM2_BUILD_ALLOW_ERRORS=0 pip install -v -e ".[notebooks]" --no-d
 RUN pip install gradio onnxruntime moviepy pydub pyannote.audio decord peft pandas matplotlib loguru sentencepiece
 
 WORKDIR /workspace
+
+RUN git clone https://github.com/gojasper/LBM.git
+RUN cd LBM && pip install --no-deps -e .
